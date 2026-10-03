@@ -1,50 +1,54 @@
 # Data Dictionary
-Source for raw fields: nflverse (`source`, `source_url`, `retrieved_at` stored per row). NULL = unavailable; 0 = participated, recorded zero.
+
+Raw tables hold only values taken from a cited source. Derived values are computed on read (`nflprops/analytics.py`) and never written back to raw tables.
+**NULL = unavailable/not applicable. 0 = participated and recorded zero.** Missing values are never converted to 0; NULLs are excluded from averages/medians.
 
 ## games (raw)
-| Field | Description | Type | Units |
-|---|---|---|---|
-| game_id | Source game identifier | text | – |
-| season, week | Season year / week number | int | – |
-| game_date, day, start_time | Kickoff date, weekday, time | text | ISO date |
-| home_team, away_team | Team abbreviations | text | – |
-| home_score, away_score | Final scores | int | points |
-| winning_team | Calculated: higher score, or TIE | text | – |
-| game_status | `final` (only completed games loaded) | text | – |
-| overtime | Overtime indicator | int | 0/1 |
-| stadium, roof, surface | Venue info (roof = indoor/outdoor) | text | – |
-| temperature, wind_mph | Weather where provided | real | °F, mph |
-| precipitation, weather | Not loaded (NULL) | text | – |
-| betting_spread_close, betting_total_close | **Market data, not official stats** | real | points |
-| source, source_url, retrieved_at, data_quality | Provenance | text | – |
+| Field | Description | Type | Units | Example |
+|---|---|---|---|---|
+| game_id | Stable game identifier from the source (Game ID) | text | – | provider-specific |
+| season, week | Season year; regular-season week | int | – | 2026, 1 |
+| game_date, day, start_time | Kickoff date / weekday / time | text | ISO date | 2026-09-10 |
+| home_team, away_team | Team abbreviations (team IDs) | text | – | KC |
+| home_score, away_score | Final score | int | points | 27 |
+| winning_team | Derived on ingest from scores if absent; `TIE` on equal score | text | – | |
+| status | `scheduled` / `final` (only `final` games feed analytics) | text | – | final |
+| overtime | 1 if overtime | int | flag | 0 |
+| stadium, indoor_outdoor, surface, weather, precipitation | Venue/conditions (if available) | text | – | |
+| temperature_f, wind_mph | Conditions | real | °F, mph | |
+| closing_spread, closing_total, betting_source | **Betting-market information, not official statistics** | real/text | points | |
+| source, source_url, retrieved_on, quality_status | Provenance (never fabricated) | text | – | |
 
 ## players (raw)
-player_id (stable GSIS id), player_name, first_name, last_name, position, current_team (latest team seen), jersey_number (NULL, not loaded).
+player_id (stable source ID; names are never used as keys), player_name, first_name, last_name, position, current_team, jersey_number.
 
-## player_game_stats (raw; key = game_id, player_id, team)
-| Field | Description | Units |
-|---|---|---|
-| team, opponent, home_away | Team the stat was recorded for; opponent; `home`/`away` | – |
-| passing_attempts, completions | Pass attempts / completions | count |
-| passing_yards, passing_touchdowns, interceptions | Passing results | yards / TDs / INTs thrown |
-| passer_rating, longest_completion | Currently NULL (not in source) | – / yards |
-| rushing_attempts, rushing_yards, rushing_touchdowns | Rushing incl. QBs | count / yards / TDs |
-| longest_rush | Currently NULL (not in source) | yards |
-| targets, receptions, receiving_yards, receiving_touchdowns | Receiving | count / yards / TDs |
-| longest_reception | Currently NULL (not in source) | yards |
-| source, source_url, retrieved_at, data_quality | Provenance | – |
+## player_game_stats (raw; key = game_id + player_id)
+| Field | Description | Type | Units |
+|---|---|---|---|
+| team | Team the player played for **in that game** | text | – |
+| opponent, home_away | Derived on ingest from the game and `team` | text | – |
+| position | Position for that game (defaults to players.position) | text | – |
+| passing_attempts, completions, passing_yards, passing_touchdowns, interceptions | Passing | int | att/cmp/yards/TDs/INTs |
+| passer_rating | Official rating if provided | real | – |
+| longest_completion | Longest completion | int | yards |
+| rushing_attempts, rushing_yards, rushing_touchdowns, longest_rush | Rushing (QB rushing included; yards may be negative) | int | att/yards/TDs/yards |
+| targets, receptions, receiving_yards, receiving_touchdowns, longest_reception | Receiving | int | – |
+| source, source_url, retrieved_on, quality_status | Provenance for the row | text | – |
 
-## Audit tables
-`change_log(changed_at, game_id, player_id, team, field, old_value, new_value, reason)`; `data_quality_log(logged_at, game_id, player_id, check_name, detail)`.
+## Logs
+`data_quality_log` (conflicts, rejected rows, discrepancies; resolved flag) and `audit_log` (old/new value, time, reason for official corrections).
 
-## Calculated (never stored in raw tables; `nflprops/analytics.py`)
+## Derived (calculated)
 | Field | Calculation |
 |---|---|
-| games_played | distinct games with a record |
-| season totals | sum of the raw column (all-NULL stays NULL) |
-| *_per_game | total / games_played |
-| window (Season, Last 3/5/8) | average, median, min, max, sample std dev (n-1) over the player's most recent N games with non-NULL values |
-| over/under | Over: stat > line; Under: stat < line; Push: equal. pct = count / non-NULL sample size |
-| home/away/opponent split | summary over games filtered by `home_away` / `opponent` |
-| opponent allowed | per game, sum of opposing players' stats (optionally by position group, venue, last N); then averaged over games |
-| joint historical hit rate | among games where every leg's player has a record, share where all legs hit; a frequency, not a probability |
+| games_played | count of final-game records for the player |
+| `<stat>_total` | sum of non-NULL values |
+| `<stat>_per_game` | total / number of games with non-NULL value |
+| window (last3/last5/last8/season) | the last N chronological final-game records (by week, date); avg, median, min, max, population std dev (`statistics.pstdev`) over non-NULL values; `n` = sample size |
+| home/away avg, vs-opponent avg | same summary restricted to those games |
+| over_pct / under_pct | games with value > line (or < line) / games with non-NULL value. Pushes (== line) counted in neither. **Historical frequency, not a probability.** |
+| opponent allowed | sum (and per-game) of stats by players whose `opponent` is the defense, over that defense's final games; window/home-away refer to the defense |
+| position groups | QB→QB; RB, FB, HB→RB; WR→WR; TE→TE (position on the player-game row). Others excluded from position splits |
+| combined historical hit | games in which every leg has data and every leg hit; count only, no product of rates |
+
+Not yet modelled (need data feeds not included here): rest days, snap counts, injury designation, starter status.

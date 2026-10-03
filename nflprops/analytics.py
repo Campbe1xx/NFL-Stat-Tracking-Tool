@@ -1,130 +1,237 @@
-"""All derived metrics. Raw tables are never modified; everything here is calculated on read."""
-import numpy as np, pandas as pd
-from . import config
+"""Derived statistics. All functions are pure reads of raw tables; nothing is stored back."""
+import statistics
 
-def load(con):
-    q = """SELECT s.*, p.player_name, p.position, g.week, g.game_date, g.betting_spread_close,
-                  g.betting_total_close, g.temperature, g.wind_mph, g.roof
-           FROM player_game_stats s JOIN players p USING(player_id) JOIN games g USING(game_id)
-           ORDER BY g.game_date"""
-    return pd.read_sql(q, con)
+MARKETS = {
+    "passing_yards": "Passing Yards", "passing_touchdowns": "Passing TDs", "interceptions": "Interceptions",
+    "rushing_yards": "Rushing Yards", "rushing_touchdowns": "Rushing TDs", "longest_rush": "Longest Rush",
+    "receptions": "Receptions", "receiving_yards": "Receiving Yards", "receiving_touchdowns": "Receiving TDs",
+    "longest_reception": "Longest Reception", "targets": "Targets",
+}
+SEASON_TOTALS = ["passing_yards", "passing_touchdowns", "interceptions", "rushing_yards", "rushing_touchdowns",
+                 "receptions", "targets", "receiving_yards", "receiving_touchdowns"]
+WINDOWS = {"last3": 3, "last5": 5, "last8": 8, "season": None}
+# Position groups used for opponent splits. Documented in docs/DATA_DICTIONARY.md.
+POSITION_GROUPS = {"QB": "QB", "RB": "RB", "FB": "RB", "HB": "RB", "WR": "WR", "TE": "TE"}
+
 
 def summarize(values):
-    v = pd.Series(values, dtype="float").dropna()
-    if v.empty:
-        return dict(n=0, average=None, median=None, minimum=None, maximum=None, std_dev=None)
-    return dict(n=len(v), average=v.mean(), median=v.median(), minimum=v.min(), maximum=v.max(),
-                std_dev=v.std(ddof=1) if len(v) > 1 else None)
+    """Stats over non-NULL values. NULL (None) is excluded, never treated as 0."""
+    v = [x for x in values if x is not None]
+    if not v:
+        return {"n": 0, "avg": None, "median": None, "min": None, "max": None, "stdev": None}
+    return {"n": len(v), "avg": sum(v) / len(v), "median": statistics.median(v), "min": min(v), "max": max(v),
+            "stdev": statistics.pstdev(v) if len(v) > 1 else None}
 
-def player_log(df, player_id, market):
-    col = config.MARKETS.get(market, market)
-    return df[df.player_id == player_id].sort_values("game_date").reset_index(drop=True), col
 
-def windows(log, col, sizes=(3, 5, 8)):
-    out = {"Season": summarize(log[col])}
-    for k in sizes:
-        out[f"Last {k}"] = summarize(log[col].tail(k))
-    return pd.DataFrame(out).T
+def check_market(market):
+    if market not in MARKETS:
+        raise ValueError(f"unknown market {market!r}")
 
-def over_under(log, col, line):
-    v = log[col].dropna()
-    n = len(v)
-    over, under, push = int((v > line).sum()), int((v < line).sum()), int((v == line).sum())
-    return dict(sample_size=n, over=over, under=under, push=push,
-                over_pct=over / n if n else None, under_pct=under / n if n else None)
 
-def splits(log, col, opponent=None):
-    r = {"Home": summarize(log[log.home_away == "home"][col]), "Away": summarize(log[log.home_away == "away"][col])}
-    if opponent:
-        r[f"vs {opponent}"] = summarize(log[log.opponent == opponent][col])
-    return pd.DataFrame(r).T
+def player_games(con, player_id, final_only=True):
+    q = ("SELECT s.*, g.week, g.game_date, g.status FROM player_game_stats s JOIN games g USING(game_id) "
+         "WHERE s.player_id=?" + (" AND g.status='final'" if final_only else "") + " ORDER BY g.week, g.game_date, s.game_id")
+    return [dict(r) for r in con.execute(q, (player_id,))]
 
-def season_totals(df):
-    g = df.groupby(["player_id", "player_name", "position"], dropna=False)
-    cols = ["passing_yards", "passing_touchdowns", "interceptions", "rushing_yards", "rushing_touchdowns",
-            "receptions", "targets", "receiving_yards", "receiving_touchdowns"]
-    t = g[cols].sum(min_count=1)  # all-NULL stays NULL
-    t["games_played"] = g.game_id.nunique()
-    for c in cols:
-        t[c + "_per_game"] = t[c] / t.games_played
-    return t.reset_index()
 
-def classify(pos):
-    return config.POSITION_GROUPS.get(pos)
+def windows(rows, market):
+    """Rows must be chronological. Returns summary per window."""
+    check_market(market)
+    vals = [r[market] for r in rows]
+    out = {}
+    for name, n in WINDOWS.items():
+        out[name] = summarize(vals if n is None else vals[-n:])
+    return out
 
-def opponent_allowed(df, window=None, home_away=None, pos_group=None):
-    """Yards/TDs/etc. allowed by each defense (= stats by opposing offensive players), per game."""
-    d = df.copy()
-    d["pos_group"] = d.position.map(classify)
-    if pos_group:
-        d = d[d.pos_group == pos_group]
-    if home_away:  # defense's venue is the opposite of the offensive player's
-        d = d[d.home_away == ("away" if home_away == "home" else "home")]
-    cols = ["passing_yards", "passing_touchdowns", "interceptions", "rushing_yards", "rushing_touchdowns",
-            "receptions", "receiving_yards", "receiving_touchdowns"]
-    per_game = d.groupby(["opponent", "game_id", "week"])[cols].sum(min_count=1).reset_index()
-    if window:
-        per_game = per_game.sort_values("week").groupby("opponent").tail(window)
-    r = per_game.groupby("opponent")[cols].mean()
-    r["games"] = per_game.groupby("opponent").game_id.nunique()
-    return r
+
+def split_summary(rows, market, key, value):
+    return summarize([r[market] for r in rows if r[key] == value])
+
+
+def hit_rate(rows, market, line):
+    """Historical frequency over/under/push versus a line. Not a probability."""
+    check_market(market)
+    obs = [(r["game_id"], r["week"], r["opponent"], r[market]) for r in rows if r[market] is not None]
+    over = [o for o in obs if o[3] > line]
+    under = [o for o in obs if o[3] < line]
+    n = len(obs)
+    return {"line": line, "sample_size": n, "over": len(over), "under": len(under), "push": n - len(over) - len(under),
+            "over_pct": len(over) / n if n else None, "under_pct": len(under) / n if n else None,
+            "observations": [{"game_id": g, "week": w, "opponent": o, "value": v} for g, w, o, v in obs],
+            "note": "Historical frequency only; not a predicted probability."}
+
 
 def histogram(values, bins=10):
-    v = pd.Series(values, dtype="float").dropna()
-    return np.histogram(v, bins=bins) if len(v) else (np.array([]), np.array([]))
+    v = [x for x in values if x is not None]
+    if not v:
+        return []
+    lo, hi = min(v), max(v)
+    if lo == hi:
+        return [{"start": lo, "end": hi, "count": len(v)}]
+    w = (hi - lo) / bins
+    counts = [0] * bins
+    for x in v:
+        counts[min(int((x - lo) / w), bins - 1)] += 1
+    return [{"start": lo + i * w, "end": lo + (i + 1) * w, "count": c} for i, c in enumerate(counts)]
 
-def leg_info(df, leg):
-    """leg: dict(player_id, market, line, side). Adds team / game info for correlation checks."""
-    log, col = player_log(df, leg["player_id"], leg["market"])
-    ou = over_under(log, col, leg["line"])
-    s = summarize(log[col])
-    team = log.team.iloc[-1] if len(log) else None
-    return dict(**leg, column=col, team=team, average=s["average"], median=s["median"],
-                recent_avg=summarize(log[col].tail(5))["average"], **ou)
 
-def joint_history(df, legs):
-    """Games in which ALL legs' players have a record; fraction where every leg hit.
-    Historical frequency only, not a probability. Legs of the same player need separate games."""
-    frames = []
-    for i, l in enumerate(legs):
-        col = config.MARKETS[l["market"]]
-        x = df[df.player_id == l["player_id"]][["game_id", col]].dropna()
-        hit = x[col] > l["line"] if l["side"] == "Over" else x[col] < l["line"]
-        frames.append(pd.DataFrame({"game_id": x.game_id, f"leg{i}": hit}).drop_duplicates("game_id"))
-    if not frames:
-        return dict(shared_games=0, all_hit=0, rate=None)
-    m = frames[0]
-    for f in frames[1:]:
-        m = m.merge(f, on="game_id")
-    n = len(m)
-    allhit = int(m.drop(columns="game_id").all(axis=1).sum()) if n else 0
-    return dict(shared_games=n, all_hit=allhit, rate=allhit / n if n else None)
+def player_profile(con, player_id, market, line=None, opponent=None):
+    check_market(market)
+    p = con.execute("SELECT * FROM players WHERE player_id=?", (player_id,)).fetchone()
+    if p is None:
+        raise KeyError(player_id)
+    rows = player_games(con, player_id)
+    res = {"player": dict(p), "market": market, "games": rows, "windows": windows(rows, market),
+           "home": split_summary(rows, market, "home_away", "home"), "away": split_summary(rows, market, "home_away", "away"),
+           "histogram": histogram([r[market] for r in rows])}
+    if opponent:
+        res["vs_opponent"] = split_summary(rows, market, "opponent", opponent)
+    if line is not None:
+        res["hit_rate"] = hit_rate(rows, market, line)
+    return res
 
-def correlation_flags(infos, game_by_team):
-    """Informational flags only; nothing is removed or recommended."""
-    flags = []
-    for i in range(len(infos)):
-        for j in range(i + 1, len(infos)):
-            a, b = infos[i], infos[j]
-            rel = []
-            if a["player_id"] == b["player_id"]:
-                rel.append("Same player")
-            if a["team"] and a["team"] == b["team"]:
-                rel.append("Same team")
-            elif game_by_team.get(a["team"]) and game_by_team.get(a["team"]) == game_by_team.get(b["team"]):
-                rel.append("Opposing teams (shared game)")
-            if not rel:
+
+def season_totals(con):
+    out = []
+    for p in con.execute("SELECT * FROM players ORDER BY player_name"):
+        rows = player_games(con, p["player_id"])
+        if not rows:
+            continue
+        rec = {"player_id": p["player_id"], "player_name": p["player_name"], "position": p["position"],
+               "team": p["current_team"], "games_played": len(rows)}
+        for m in SEASON_TOTALS:
+            vals = [r[m] for r in rows if r[m] is not None]
+            rec[m + "_total"] = sum(vals) if vals else None
+            rec[m + "_per_game"] = sum(vals) / len(vals) if vals else None
+        out.append(rec)
+    return out
+
+
+def rolling_table(con):
+    out = []
+    for p in con.execute("SELECT * FROM players ORDER BY player_name"):
+        rows = player_games(con, p["player_id"])
+        if not rows:
+            continue
+        for m in MARKETS:
+            if all(r[m] is None for r in rows):
                 continue
-            note = ""
-            ps = {"Passing Yards", "Passing TDs"}
-            rs = {"Receiving Yards", "Receiving TDs", "Receptions"}
-            if "Same team" in rel and ((a["market"] in ps and b["market"] in rs) or (b["market"] in ps and a["market"] in rs)):
-                note = "Passing and receiving outcomes for the same offense tend to move together."
-            elif "Same player" in rel and {a["market"], b["market"]} == {"Receptions", "Receiving Yards"}:
-                note = "Receptions and receiving yards for one player are mechanically related."
-            elif "Same team" in rel and a["market"] == b["market"] and a["market"] in rs:
-                note = "Teammates compete for the same targets/passing volume."
-            elif "Opposing teams (shared game)" in rel:
-                note = "Opposing players share game script (score, pace)."
-            flags.append(dict(leg_a=i + 1, leg_b=j + 1, relationship=", ".join(rel), note=note))
+            for w, s in windows(rows, m).items():
+                out.append({"player_id": p["player_id"], "player_name": p["player_name"], "market": m, "window": w,
+                            **{k: s[k] for k in ("n", "avg", "median", "min", "max", "stdev")}})
+    return out
+
+
+def compare(con, player_ids, market, line=None):
+    check_market(market)
+    out = []
+    for pid in player_ids:
+        p = con.execute("SELECT player_name FROM players WHERE player_id=?", (pid,)).fetchone()
+        if p is None:
+            continue
+        rows = player_games(con, pid)
+        w = windows(rows, market)
+        rec = {"player_id": pid, "player_name": p["player_name"], "games": w["season"]["n"], "season_avg": w["season"]["avg"],
+               "last5_avg": w["last5"]["avg"], "median": w["season"]["median"], "stdev": w["season"]["stdev"]}
+        if line is not None:
+            hr = hit_rate(rows, market, line)
+            rec["over_pct"], rec["sample_size"] = hr["over_pct"], hr["sample_size"]
+        out.append(rec)
+    return out  # intentionally unranked; the UI sorts on user's choice
+
+
+def opponent_allowed(con, window=None, home_away=None, position_group=None):
+    """Totals/averages allowed by each defense. home_away is the DEFENSE's venue."""
+    allowed_cols = ["passing_yards", "passing_touchdowns", "interceptions", "rushing_yards", "rushing_touchdowns",
+                    "receptions", "receiving_yards", "receiving_touchdowns"]
+    teams = {}
+    games = con.execute("SELECT * FROM games WHERE status='final' ORDER BY week, game_date, game_id").fetchall()
+    by_def = {}
+    for g in games:
+        for d, venue in ((g["home_team"], "home"), (g["away_team"], "away")):
+            by_def.setdefault(d, []).append((g["game_id"], venue))
+    for d, glist in by_def.items():
+        if home_away:
+            glist = [x for x in glist if x[1] == home_away]
+        if window:
+            glist = glist[-window:]
+        agg = {c: 0 for c in allowed_cols}
+        for gid, _ in glist:
+            for r in con.execute("SELECT * FROM player_game_stats WHERE game_id=? AND opponent=?", (gid, d)):
+                if position_group and POSITION_GROUPS.get(r["position"]) != position_group:
+                    continue
+                for c in allowed_cols:
+                    if r[c] is not None:
+                        agg[c] += r[c]
+        n = len(glist)
+        teams[d] = {"games": n, **{c + "_total": agg[c] for c in allowed_cols},
+                    **{c + "_per_game": (agg[c] / n if n else None) for c in allowed_cols}}
+    return teams
+
+
+# ---- Parlay -------------------------------------------------------------
+def _side(leg):
+    return leg.get("side", "over")
+
+
+def correlation_flags(legs):
+    """legs: dicts with player_id, market, line, side, team, game_id (resolved). Flags only; never removes legs."""
+    flags = []
+    fam = lambda m: "pass" if m.startswith("passing") else "rush" if m.startswith("rushing") else "rec"
+    for i in range(len(legs)):
+        for j in range(i + 1, len(legs)):
+            a, b = legs[i], legs[j]
+            tag = f"Leg {i + 1} & Leg {j + 1}"
+            if a["player_id"] == b["player_id"]:
+                flags.append({"legs": [i, j], "type": "same_player", "message": f"{tag}: same player (stats are strongly related, e.g. receptions and receiving yards)"})
+                continue
+            if a.get("game_id") and a.get("game_id") == b.get("game_id"):
+                flags.append({"legs": [i, j], "type": "shared_game", "message": f"{tag}: both in game {a['game_id']}"})
+            if a.get("team") and a.get("team") == b.get("team"):
+                ma, mb = a["market"], b["market"]
+                note = "same team"
+                if {fam(ma), fam(mb)} == {"pass", "rec"}:
+                    note = "same team passing/receiving production is typically linked"
+                elif fam(ma) == fam(mb) == "rec" and _side(a) == _side(b):
+                    note = "same-team receivers share a target pool and game script"
+                flags.append({"legs": [i, j], "type": "same_team", "message": f"{tag}: {note}"})
+            elif a.get("game_id") and a.get("game_id") == b.get("game_id"):
+                flags.append({"legs": [i, j], "type": "opposing_team", "message": f"{tag}: opposing teams in the same game (game script may link them)"})
     return flags
+
+
+def parlay(con, legs):
+    out, resolved = [], []
+    for leg in legs:
+        check_market(leg["market"])
+        rows = player_games(con, leg["player_id"])
+        side = _side(leg)
+        if side not in ("over", "under"):
+            raise ValueError("side must be over or under")
+        w = windows(rows, leg["market"])
+        hr = hit_rate(rows, leg["market"], leg["line"])
+        hit = (lambda v: v > leg["line"]) if side == "over" else (lambda v: v < leg["line"])
+        hits = {o["game_id"] for o in hr["observations"] if hit(o["value"])}
+        p = con.execute("SELECT player_name, current_team FROM players WHERE player_id=?", (leg["player_id"],)).fetchone()
+        up = con.execute("SELECT g.game_id,g.home_team,g.away_team FROM games g WHERE g.status!='final' AND (g.home_team=? OR g.away_team=?) ORDER BY g.week LIMIT 1",
+                         (p["current_team"], p["current_team"])).fetchone() if p else None
+        info = {"player_id": leg["player_id"], "player": p["player_name"] if p else None, "market": leg["market"],
+                "line": leg["line"], "side": side, "average": w["season"]["avg"], "median": w["season"]["median"],
+                "recent_avg": w["last5"]["avg"], "over_pct": hr["over_pct"], "under_pct": hr["under_pct"],
+                "sample_size": hr["sample_size"], "hit_game_ids": sorted(hits)}
+        out.append(info)
+        resolved.append({**leg, "side": side, "team": p["current_team"] if p else None,
+                         "game_id": leg.get("game_id") or (up["game_id"] if up else None)})
+    # Combined historical hit: only games in which ALL legs have an observation.
+    sets = [{o["game_id"] for o in hit_rate(player_games(con, l["player_id"]), l["market"], l["line"])["observations"]} for l in legs]
+    common = set.intersection(*sets) if sets else set()
+    joint = None
+    if len(legs) > 1 and common:
+        joint = {"games_where_all_legs_have_data": len(common),
+                 "games_where_all_legs_hit": len(common & set.intersection(*[set(i["hit_game_ids"]) for i in out]))}
+    elif len(legs) > 1:
+        joint = {"games_where_all_legs_have_data": 0, "games_where_all_legs_hit": 0,
+                 "note": "No shared games in the sample; a combined historical hit rate cannot be computed from the data."}
+    return {"legs": out, "n_legs": len(out), "combined_historical": joint, "correlation_flags": correlation_flags(resolved),
+            "disclaimer": "Historical hit rate is the observed frequency in past games. It is NOT an estimated probability, "
+                          "and individual rates are deliberately not multiplied together. Not a recommendation."}

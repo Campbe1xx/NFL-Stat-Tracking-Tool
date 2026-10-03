@@ -1,27 +1,16 @@
-# NFL Stat Tracking Tool – 2026 Regular-Season Player Prop Analytics
+# NFL Stat Tracking Tool — 2026 Regular Season Player Prop Analytics
 
-SQLite database + Streamlit dashboard of game-by-game player stats (Game → Team → Player → Performance).
-Descriptive history only: no predictions, no betting recommendations, no invented numbers.
+A dependency-free (Python 3.9+ stdlib) game-by-game player database (SQLite), validation/QA, derived stats, export, and a local interactive dashboard.
 
-## Usage
-```
-pip install -r requirements.txt
-python -m nflprops.ingest            # weekly: loads newly completed REG games, writes QA to stdout
-streamlit run app.py
-pytest
-```
-`ingest` is idempotent. Re-ingesting a changed value is recorded in `change_log` (old/new) instead of silently overwriting. QA anomalies go to `data_quality_log`.
-Use `--games-src/--stats-src` for local CSVs. Raw tables (`games`, `players`, `player_game_stats`) hold only source data; all derived metrics are computed on read in `nflprops/analytics.py`.
+**No NFL data is bundled.** This tool never invents or estimates statistics. Official 2026 data must be loaded from an authoritative source (NFL.com stats/gamebooks, etc.) with its source reference; the app does not scrape anything.
 
-## Important limitations (honest status)
-- **No 2026 data is bundled.** Run the ingest after games are played; the sandbox that built this had no data.
-- Source is nflverse (secondary, derived from NFL data). Every row is tagged `data_quality = unverified_secondary`; cross-checking with official gamebooks is **not automated** and must be done manually for discrepancies (record them in `data_quality_log`/`change_log`).
-- Longest rush/reception/completion and passer rating are not in the source → stored as **NULL** (never 0); the longest-* markets will be empty until a gamebook source is added.
-- Weather/precipitation, rest days, snaps, injury designation, starter status are not loaded. Spread/total are **betting-market data, not official stats** (`betting_*` columns).
-- Parlay "historical hit rate" counts only games where all legs' players have records, and is not a probability.
+## Weekly workflow
+1. Put `games`, `players`, `player_game_stats` as `.csv` or `.json` in a directory (columns: see `nflprops/schema.sql`; `source` required, include `source_url`, `retrieved_on`, `quality_status`; leave unknown values empty → NULL).
+2. `python -m nflprops ingest data/incoming` — validates, inserts new records, never overwrites a differing value (conflict is written to `data_quality_log`). Use `--correction --reason "NFL stat correction ..."` for official corrections; old values go to `audit_log`.
+3. `python -m nflprops qa --expected-games N --output docs/QA_REPORT.md` — completeness, duplicates, impossible values, team-total reconciliation (passing vs. receiving yards/TDs).
+4. `python -m nflprops serve` → http://127.0.0.1:8000 (Player Explorer, Prop Analyzer, Parlay Builder, Comparison, Opponents, Export/QA). Derived stats are recomputed on every request.
+5. `python -m nflprops export data/export` — CSV per table, JSON, Excel.
 
-## Position classification (opponent splits)
-QB=QB; RB=RB, FB, HB; WR=WR; TE=TE (`config.POSITION_GROUPS`). Defense "allowed" = stats by opposing offensive players.
+Cross-source verification and discrepancy resolution against the official gamebook remain a manual step: record outcomes in `data_quality_log` / `quality_status`. See `docs/DATA_DICTIONARY.md`. Tests: `python -m unittest discover -s tests` (synthetic fixtures only).
 
-## Data dictionary
-See [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md).
+Output is historical frequency, not probability or betting advice.

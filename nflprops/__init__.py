@@ -1,1 +1,1 @@
-"""NFL regular-season player-prop analytics."""
+"""NFL regular-season player prop analytics database and dashboard."""

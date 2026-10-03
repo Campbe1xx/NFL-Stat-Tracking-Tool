@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>NFL 2026 Prop Analytics</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:1rem 2rem;color:#222}
+nav button{margin-right:.4rem;padding:.4rem .8rem}nav button.on{background:#222;color:#fff}
+table{border-collapse:collapse;margin:.6rem 0}td,th{border:1px solid #ccc;padding:.2rem .5rem;text-align:right}th{background:#f3f3f3}
+td:first-child,th:first-child{text-align:left}label{margin-right:.8rem}.note{color:#555;font-size:.85rem}
+.warn{background:#fff4d6;padding:.3rem .6rem;margin:.2rem 0}.bar{display:inline-block;background:#4a7;height:12px}
+.bar.over{background:#c64}section{display:none}section.on{display:block}
+</style></head><body>
+<h1>NFL 2026 Regular Season — Player Prop Analytics</h1>
+<p class="note">Historical frequencies from recorded games. Not predictions or recommendations; past results do not guarantee future results. Empty cells mean the statistic is unavailable (NULL), not zero.</p>
+<nav id="nav"></nav>
+<section id="p1"><h2>Player Explorer</h2><div id="c1"></div><div id="o1"></div></section>
+<section id="p2"><h2>Prop Analyzer</h2><div id="c2"></div><div id="o2"></div></section>
+<section id="p3"><h2>Parlay Builder</h2><div id="c3"></div><div id="o3"></div></section>
+<section id="p4"><h2>Player Comparison</h2><div id="c4"></div><div id="o4"></div></section>
+<section id="p5"><h2>Opponent Analysis</h2><div id="c5"></div><div id="o5"></div></section>
+<section id="p6"><h2>Export &amp; QA</h2><div id="o6"></div></section>
+<script>
+const $=id=>document.getElementById(id);
+function el(tag,attrs,...kids){const e=document.createElement(tag);for(const[k,v]of Object.entries(attrs||{})){if(k==='on')for(const[ev,f]of Object.entries(v))e.addEventListener(ev,f);else e[k]=v}
+ for(const k of kids.flat())e.append(k instanceof Node?k:String(k));return e}
+const fmt=v=>v===null||v===undefined?'':(typeof v==='number'&&!Number.isInteger(v)?v.toFixed(2):v);
+const pct=v=>v===null||v===undefined?'':(100*v).toFixed(1)+'%';
+function table(cols,rows){return el('table',{},el('tr',{},cols.map(c=>el('th',{},c[0]))),rows.map(r=>el('tr',{},cols.map(c=>el('td',{},c[2]?c[2](r[c[1]]):fmt(r[c[1]]))))))}
+let meta;
+async function api(u,opt){const r=await fetch(u,opt);return r.json()}
+function select(opts,val,onchange){const s=el('select',{on:{change:onchange}});for(const[v,t]of opts){const o=el('option',{value:v},t);if(v===val)o.selected=true;s.append(o)}return s}
+const state={};
+function controls(box,names,onGo){box.replaceChildren();
+ const mk=(k,l,w)=>{box.append(el('label',{},l+' ',w))};
+ const playerOpts=(team,pos)=>[['','—']].concat(meta.players.filter(p=>(!team||p.current_team===team)&&(!pos||p.position===pos)).map(p=>[p.player_id,`${p.player_name} (${p.current_team||'?'} ${p.position||''})`]));
+ const refs={};
+ if(names.includes('team'))mk('team','Team',refs.team=select([['','All']].concat(meta.teams.map(t=>[t,t])),'',()=>fill()));
+ if(names.includes('position'))mk('position','Position',refs.position=select([['','All']].concat([...new Set(meta.players.map(p=>p.position).filter(Boolean))].map(t=>[t,t])),'',()=>fill()));
+ const fill=()=>{if(refs.player){const cur=refs.player.value;const o=playerOpts(refs.team&&refs.team.value,refs.position&&refs.position.value);refs.player.replaceChildren(...o.map(([v,t])=>el('option',{value:v,selected:v===cur},t)))}};
+ if(names.includes('player')){refs.player=el('select');mk('player','Player',refs.player);fill()}
+ if(names.includes('market'))mk('market','Market',refs.market=select(Object.entries(meta.markets),'receiving_yards',()=>{}));
+ if(names.includes('line'))mk('line','Line',refs.line=el('input',{type:'number',step:'0.5',size:6}));
+ if(names.includes('opponent'))mk('opponent','Opponent',refs.opponent=select([['','Any']].concat(meta.teams.map(t=>[t,t])),'',()=>{}));
+ if(names.includes('week'))mk('week','Week',refs.week=select([['','All']].concat(meta.weeks.map(w=>[w,w])),'',()=>{}));
+ box.append(el('button',{on:{click:()=>onGo(refs)}},'Show'));return refs}
+function summaryTable(prof){const w=prof.windows;const rows=[['Season',w.season],['Last 3',w.last3],['Last 5',w.last5],['Last 8',w.last8],['Home',prof.home],['Away',prof.away]];if(prof.vs_opponent)rows.push(['vs selected opponent',prof.vs_opponent]);
+ return table([['Window',0],['n',1],['Avg',2],['Median',3],['Min',4],['Max',5],['Std dev',6]].map(([h,i])=>[h,i]),rows.map(([n,s])=>({0:n,1:s.n,2:s.avg,3:s.median,4:s.min,5:s.max,6:s.stdev})))}
+function gamesTable(prof){return table([['Wk','week'],['Opponent','opponent'],['H/A','home_away'],['Targets','targets'],['Rec','receptions'],['Rec Yds','receiving_yards'],['Rec TD','receiving_touchdowns'],['Long Rec','longest_reception'],['Rush Att','rushing_attempts'],['Rush Yds','rushing_yards'],['Rush TD','rushing_touchdowns'],['Long Rush','longest_rush'],['Pass Yds','passing_yards'],['Pass TD','passing_touchdowns'],['INT','interceptions'],['Source','source'],['Quality','quality_status']],prof.games)}
+function chart(prof,line){const m=prof.market;const vals=prof.games.map(g=>g[m]);const mx=Math.max(1,line||0,...vals.filter(v=>v!==null));
+ return el('div',{},el('h3',{},'Game-by-game: '+meta.markets[m]),prof.games.map(g=>el('div',{},`Wk ${g.week} ${g.opponent}: `,el('span',{className:'bar'+(line!=null&&g[m]!==null&&g[m]>line?' over':''),style:`width:${(g[m]||0)/mx*300}px`}),' '+fmt(g[m]))),line!=null?el('div',{className:'note'},`Red bars are above the line ${line}.`):'')}
+function histo(prof,line){const h=prof.histogram;const mx=Math.max(1,...h.map(b=>b.count));return el('div',{},el('h3',{},'Distribution'),h.map(b=>el('div',{},`${fmt(b.start)}–${fmt(b.end)} `,el('span',{className:'bar'+(line!=null&&b.start>=line?' over':''),style:`width:${b.count/mx*200}px`}),' '+b.count)),line!=null?el('div',{},`Prop line: ${line}`):'')}
+function hitTable(hr){return el('div',{},el('p',{},`Over ${hr.over} (${pct(hr.over_pct)}) · Under ${hr.under} (${pct(hr.under_pct)}) · Push ${hr.push} · Sample size ${hr.sample_size}. `,el('span',{className:'note'},hr.note)),table([['Week','week'],['Opponent','opponent'],['Value','value']],hr.observations))}
+async function showPlayer(refs,out,withLine){if(!refs.player.value)return;const q=new URLSearchParams({player_id:refs.player.value,market:refs.market.value});
+ if(refs.line&&refs.line.value)q.set('line',refs.line.value);if(refs.opponent&&refs.opponent.value)q.set('opponent',refs.opponent.value);if(refs.week&&refs.week.value)q.set('week',refs.week.value);
+ const prof=await api('/api/player?'+q);out.replaceChildren();if(prof.error){out.append(prof.error);return}
+ const line=refs.line&&refs.line.value?parseFloat(refs.line.value):null;
+ out.append(summaryTable(prof),chart(prof,line),histo(prof,line));if(prof.hit_rate)out.append(el('h3',{},'Historical over/under'),hitTable(prof.hit_rate));out.append(el('h3',{},'Game log'),gamesTable(prof))}
+const legs=[];let legRefs;
+function renderLegs(){const o=$('o3');o.replaceChildren(el('h3',{},`Legs (${legs.length})`),...legs.map((l,i)=>el('div',{},`${i+1}. ${l.name} — ${l.side} ${l.line} ${meta.markets[l.market]} `,el('button',{on:{click:()=>{legs.splice(i,1);renderLegs()}}},'remove'))));if(legs.length)o.append(el('button',{on:{click:analyze}},'Analyze parlay'));o.append(el('div',{id:'pr'}))}
+async function analyze(){const r=await api('/api/parlay',{method:'POST',body:JSON.stringify({legs:legs.map(l=>({player_id:l.player_id,market:l.market,line:l.line,side:l.side}))})});const d=$('pr');d.replaceChildren();if(r.error){d.append(r.error);return}
+ d.append(table([['Player','player'],['Market','market',v=>meta.markets[v]],['Side','side'],['Line','line'],['Avg','average'],['Median','median'],['Recent avg (L5)','recent_avg'],['Over %','over_pct',pct],['Under %','under_pct',pct],['Sample','sample_size']],r.legs));
+ d.append(el('p',{},`Legs: ${r.n_legs}`));
+ if(r.combined_historical){const c=r.combined_historical;d.append(el('p',{},`Combined historical: all legs hit in ${c.games_where_all_legs_hit} of ${c.games_where_all_legs_have_data} games where every leg has data. ${c.note||''}`))}
+ r.correlation_flags.forEach(f=>d.append(el('div',{className:'warn'},`[${f.type}] ${f.message}`)));d.append(el('p',{className:'note'},r.disclaimer))}
+let cmpSel=[];
+async function init(){meta=await api('/api/meta');
+ const pages=[['p1','Player Explorer'],['p2','Prop Analyzer'],['p3','Parlay Builder'],['p4','Compare'],['p5','Opponents'],['p6','Export & QA']];
+ pages.forEach(([id,t],i)=>{$('nav').append(el('button',{className:i?'':'on',on:{click:ev=>{document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===id));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b===ev.target))}}},t))});$('p1').classList.add('on');
+ controls($('c1'),['team','position','player','market','opponent','week'],r=>showPlayer(r,$('o1')));
+ controls($('c2'),['team','position','player','market','line','opponent'],r=>showPlayer(r,$('o2')));
+ legRefs=controls($('c3'),['team','player','market','line'],()=>{});
+ const side=select([['over','Over'],['under','Under']],'over',()=>{});$('c3').prepend(el('label',{},'Side ',side));
+ $('c3').append(el('button',{on:{click:()=>{const r=legRefs;if(!r.player.value||!r.line.value)return;const p=meta.players.find(x=>x.player_id===r.player.value);legs.push({player_id:p.player_id,name:p.player_name,market:r.market.value,line:parseFloat(r.line.value),side:side.value});renderLegs()}}},'Add leg'));renderLegs();
+ const r4=controls($('c4'),['team','position','player','market','line'],async r=>{const q=new URLSearchParams({player_ids:cmpSel.join(','),market:r.market.value});if(r.line.value)q.set('line',r.line.value);const d=await api('/api/compare?'+q);cmpData=d;drawCmp()});
+ $('c4').append(el('button',{on:{click:()=>{if(r4.player.value&&!cmpSel.includes(r4.player.value))cmpSel.push(r4.player.value);$('o4').replaceChildren(`Selected IDs: ${cmpSel.join(', ')}`)}}},'Add to comparison'),el('button',{on:{click:()=>{cmpSel=[];$('o4').replaceChildren()}}},'Clear'));
+ const r5=controls($('c5'),[],()=>{});const ws=select([['','All games'],['3','Last 3'],['5','Last 5'],['8','Last 8']],'',()=>{}),ha=select([['','Home+Away'],['home','Defense at home'],['away','Defense away']],'',()=>{}),pg=select([['','All positions'],['QB','vs QB'],['RB','vs RB'],['WR','vs WR'],['TE','vs TE']],'',()=>{});
+ $('c5').prepend(ws,ha,pg);$('c5').append(el('button',{on:{click:async()=>{const q=new URLSearchParams({window:ws.value,home_away:ha.value,position_group:pg.value});const d=await api('/api/opponents?'+q);const cols=['passing_yards','passing_touchdowns','interceptions','rushing_yards','rushing_touchdowns','receptions','receiving_yards','receiving_touchdowns'];
+  $('o5').replaceChildren(table([['Team','team'],['G','games']].concat(cols.map(c=>[c.replace('_',' ')+'/g',c+'_per_game'])),Object.entries(d).map(([t,v])=>({team:t,...v}))),el('p',{className:'note'},'Position groups: QB; RB (RB/FB/HB); WR; TE — by the position recorded on each player-game row. Small samples are noisy.'))}}},'Show'));
+ const o6=$('o6');o6.append(el('h3',{},'Export (raw + derived + sources + quality flags)'),el('a',{href:'/api/export.csv'},'CSV (player-game)'),' | ',el('a',{href:'/api/export.xlsx'},'Excel'),' | ',el('a',{href:'/api/export.json'},'JSON'));
+ const q=await api('/api/qa');o6.append(el('h3',{},'Data-quality checks: '+(q.passed?'passed':'FAILED')),el('pre',{},JSON.stringify(q.coverage,null,1)),...q.issues.map(i=>el('div',{className:'warn'},`[${i.severity}] ${i.message} ${i.game_id||''} ${i.player_id||''}`)))}
+let cmpData=[];let cmpSort='player_name';
+function drawCmp(){const o=$('o4');const cols=[['Player','player_name'],['Games','games'],['Season avg','season_avg'],['Last 5 avg','last5_avg'],['Median','median'],['Std dev','stdev'],['Over %','over_pct',pct]];
+ const rows=[...cmpData].sort((a,b)=>(a[cmpSort]>b[cmpSort])-(a[cmpSort]<b[cmpSort]));
+ const t=table(cols,rows);t.querySelectorAll('th').forEach((th,i)=>{th.style.cursor='pointer';th.title='sort';th.addEventListener('click',()=>{cmpSort=cols[i][1];drawCmp()})});
+ o.replaceChildren(t,el('p',{className:'note'},'Click a header to sort. Players are not ranked.'))}
+init();
+</script></body></html>
